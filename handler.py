@@ -5,12 +5,12 @@ import time
 import uuid
 import hashlib
 import logging
+import requests
+import base64
+import re
 from typing import Tuple, Optional
 from urllib.parse import urlparse
 from datetime import timedelta
-
-import torch
-import requests
 from PIL import Image
 from PIL.Image import Image as PILImage
 from pydantic import BaseModel, HttpUrl, validator
@@ -18,10 +18,8 @@ from minio import Minio
 from minio.error import S3Error
 import runpod
 from dotenv import load_dotenv
-
-from diffusers import QwenImageEditPipeline, DPMSolverMultistepScheduler
-from diffusers.utils import load_image
-from diffusers.models.attention_dispatch import attention_backend, AttentionBackendName
+import llama_cpp
+from llama_cpp import Llama
 
 # Load environment variables
 load_dotenv()
@@ -78,6 +76,10 @@ MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", "26214400"))  # 25 MB
 TIMEOUT_SECONDS = int(os.getenv("TIMEOUT_SECONDS", "120"))
 HF_TOKEN = os.getenv("HF_TOKEN")
 
+# GGUF model configuration
+GGUF_MODEL_PATH = os.getenv("GGUF_MODEL_PATH", "/models/qwen-image-edit-q4_k_m.gguf")
+GGUF_MODEL_URL = os.getenv("GGUF_MODEL_URL", "https://huggingface.co/Phil2Sat/Qwen-Image-Edit-Rapid-AIO-GGUF/resolve/main/Qwen-Rapid-AIO-NSFW-v18.1-Q4_K_M.gguf")
+
 # Validate required environment variables
 required_env_vars = [
     ("S3_ENDPOINT", S3_ENDPOINT),
@@ -112,9 +114,8 @@ class ImageEditInput(BaseModel):
     prompt: str
     negative_prompt: str = ""
     seed: Optional[int] = None
-    num_inference_steps: int = 40  # Increased from 30 for better stability
-    guidance_scale: float = 5.0  # Reduced from 7.5 for better stability
-    scheduler: str = "EulerAncestral"
+    num_inference_steps: int = 30
+    guidance_scale: float = 1.5  # true_cfg_scale in GGUF models
     extra: dict = {}
 
     @validator("image_url")
@@ -127,125 +128,103 @@ class ImageEditInput(BaseModel):
 # Global model variable
 model = None
 
+def download_model(job_id: str):
+    """Download GGUF model from Hugging Face if not exists"""
+    if os.path.exists(GGUF_MODEL_PATH):
+        logger.info(job_id, "Model already exists locally", path=GGUF_MODEL_PATH)
+        return
+    
+    logger.info(job_id, "Model not found locally, downloading from Hugging Face", url=GGUF_MODEL_URL)
+    
+    # Create directory if it doesn't exist
+    os.makedirs(os.path.dirname(GGUF_MODEL_PATH), exist_ok=True)
+    
+    try:
+        # Download with progress
+        response = requests.get(GGUF_MODEL_URL, stream=True)
+        response.raise_for_status()
+        
+        total_size = int(response.headers.get('content-length', 0))
+        downloaded = 0
+        last_log_time = time.time()
+        
+        with open(GGUF_MODEL_PATH, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    
+                    # Log progress every 5 seconds
+                    current_time = time.time()
+                    if total_size > 0 and current_time - last_log_time > 5:
+                        percent = (downloaded / total_size) * 100
+                        logger.info(job_id, f"Download progress: {percent:.1f}%")
+                        last_log_time = current_time
+        
+        logger.info(job_id, "Model downloaded successfully", 
+                   path=GGUF_MODEL_PATH,
+                   size_bytes=downloaded)
+        
+    except Exception as e:
+        logger.error(job_id, "Failed to download model", error=str(e))
+        # Clean up partial download
+        if os.path.exists(GGUF_MODEL_PATH):
+            os.remove(GGUF_MODEL_PATH)
+        raise
+
 def load_model():
-    """Load the Qwen-Image-Edit model once at cold start with VRAM optimizations"""
+    """Load GGUF version of Qwen-Image-Edit using llama.cpp"""
     global model
     if model is None:
         job_id = "MODEL_INIT"
-        logger.info(job_id, "Loading Qwen-Image-Edit model with VRAM optimizations...")
+        logger.info(job_id, "Loading GGUF Qwen-Image-Edit model...")
         load_start = time.time()
         
-        try:            
-            # Log CUDA availability
+        try:
+            # Download model if needed
+            download_model(job_id)
+            
+            # Check CUDA availability
+            import torch
             if not torch.cuda.is_available():
                 logger.error(job_id, "CUDA is not available. This application requires a GPU.")
                 raise RuntimeError("CUDA is not available. This application requires a GPU.")
             
-            logger.info(job_id, "CUDA is available", device_count=torch.cuda.device_count())
+            logger.info(job_id, "CUDA is available", 
+                       device_count=torch.cuda.device_count(),
+                       device_name=torch.cuda.get_device_name(0))
             
-            # Load the Qwen model with memory optimizations
-            model_load_start = time.time()
+            # Load model with llama.cpp
+            logger.info(job_id, "Loading model with llama.cpp")
             
-            # Load model with optimizations
-            logger.info(job_id, "Loading QwenImageEditPipeline from_pretrained")
-            # Use scaled dot-product attention during model loading
-            with attention_backend(AttentionBackendName.NATIVE):
-                model = QwenImageEditPipeline.from_pretrained(
-                    "Qwen/Qwen-Image-Edit",
-                    torch_dtype=torch.float16,  # Use float16 instead of bfloat16 for lower memory usage
-                    token=HF_TOKEN,
-                )
-            logger.info(job_id, "QwenImageEditPipeline loaded successfully")
+            # Determine optimal number of GPU layers (33 = all layers for 7B model)
+            n_gpu_layers = 33  # Offload all layers to GPU
             
-            # Move model to GPU
-            move_start = time.time()
-            model = model.to("cuda")
-
-            move_time = time.time() - move_start
-            logger.info(job_id, "Moved model to CUDA", move_time=f"{move_time:.2f}s")
-            
-            # --- fix black images *without* dtype mismatch ---
-
-            vae = getattr(model, "vae", None)
-            if vae is not None:
-                try:
-                    # Keep encoder-side in fp16 to match pipeline inputs
-                    if hasattr(vae, "encoder"):
-                        vae.encoder.to(dtype=torch.float16)
-                    if hasattr(vae, "quant_conv"):
-                        vae.quant_conv.to(dtype=torch.float16)
-
-                    # Upcast decoder-side to fp32 to prevent underflow (black outputs)
-                    if hasattr(vae, "decoder"):
-                        vae.decoder.to(dtype=torch.float32)
-                    if hasattr(vae, "post_quant_conv"):
-                        vae.post_quant_conv.to(dtype=torch.float32)
-
-                    # Optional: slicing helps peak VRAM
-                    try:
-                        model.enable_vae_slicing()
-                    except Exception:
-                        pass
-
-                    # Belt-and-suspenders: ensure latents are fp32 at decode entry
-                    if hasattr(vae, "decode"):
-                        _orig_decode = vae.decode
-                        def _decode_fp32(z, *a, **k):
-                            return _orig_decode(z.to(dtype=torch.float32), *a, **k)
-                        vae.decode = _decode_fp32
-
-                    # (Avoid upcasting the whole VAE or setting force_upcast=True globally)
-                except Exception as e:
-                    logger.warning(job_id, "VAE partial upcast tweak failed", error=str(e))
-
-            # --- /fix ---
-            
-            model_load_time = time.time() - model_load_start
-            logger.info(job_id, "Successfully loaded Qwen/Qwen-Image-Edit model", 
-                       load_time=f"{model_load_time:.2f}s",
-                       dtype=str(model.dtype))
+            model = Llama(
+                model_path=GGUF_MODEL_PATH,
+                n_ctx=4096,  # Context window
+                n_gpu_layers=n_gpu_layers,
+                n_threads=8,  # CPU threads for prompt processing
+                verbose=False,
+                use_mmap=True,
+                use_mlock=False,  # Don't lock memory
+                seed=42,  # Default seed for reproducibility
+            )
             
             load_time = time.time() - load_start
-            logger.info(job_id, "Model loaded successfully", total_load_time=f"{load_time:.2f}s")
+            logger.info(job_id, "GGUF model loaded successfully", 
+                       total_load_time=f"{load_time:.2f}s",
+                       model_path=GGUF_MODEL_PATH,
+                       n_gpu_layers=n_gpu_layers)
+            
         except Exception as e:
-            logger.error(job_id, "Failed to load model", error=str(e))
+            logger.error(job_id, "Failed to load GGUF model", error=str(e))
             raise
     return model
 
 def sha256_hex(text: str) -> str:
     """Calculate SHA256 hash of a string and return hex representation"""
     return hashlib.sha256(text.encode('utf-8')).hexdigest()
-
-def get_image_extension(content_type: str, url: str) -> str:
-    """Determine image extension from content-type or URL"""
-    content_type_map = {
-        "image/jpeg": "jpg",
-        "image/jpg": "jpg",
-        "image/png": "png",
-        "image/webp": "webp",
-        "image/bmp": "bmp",
-        "image/tiff": "tiff",
-    }
-    
-    if content_type in content_type_map:
-        return content_type_map[content_type]
-    
-    # Fallback to URL extension
-    parsed_url = urlparse(url)
-    path = parsed_url.path.lower()
-    if path.endswith(".jpg") or path.endswith(".jpeg"):
-        return "jpg"
-    elif path.endswith(".png"):
-        return "png"
-    elif path.endswith(".webp"):
-        return "webp"
-    elif path.endswith(".bmp"):
-        return "bmp"
-    elif path.endswith(".tiff") or path.endswith(".tif"):
-        return "tiff"
-    
-    # Default fallback
-    return "png"
 
 def encode_image(job_id: str, image: PILImage, format: str, quality: int = 95) -> Tuple[bytes, str, str]:
     """Encode PIL image to bytes with specified format"""
@@ -279,194 +258,115 @@ def encode_image(job_id: str, image: PILImage, format: str, quality: int = 95) -
                encode_time=f"{encode_time:.2f}s")
     return image_bytes, extension, content_type
 
+def image_to_base64(image: PILImage) -> str:
+    """Convert PIL image to base64 string"""
+    buffered = io.BytesIO()
+    image.save(buffered, format="PNG")
+    return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
+def base64_to_image(base64_str: str) -> PILImage:
+    """Convert base64 string to PIL image"""
+    image_bytes = base64.b64decode(base64_str)
+    return Image.open(io.BytesIO(image_bytes))
 
-def run_qwen_edit(job_id: str, model, image: PILImage, prompt: str, **kwargs) -> PILImage:
-    """Run Qwen-Image-Edit on the input image with VRAM optimizations and scaled dot-product attention"""
-    logger.info(job_id, "Running Qwen-Image-Edit", prompt=prompt)
-    logger.debug(job_id, "Model parameters", **kwargs)
+def run_qwen_edit_gguf(job_id: str, model, image: PILImage, prompt: str, **kwargs) -> PILImage:
+    """Run Qwen-Image-Edit GGUF model"""
+    logger.info(job_id, "Running Qwen-Image-Edit GGUF", prompt=prompt)
+    infer_start = time.time()
     
     try:
-        
         # Extract parameters
-        negative_prompt = kwargs.get("negative_prompt", "")
         seed = kwargs.get("seed", None)
+        cfg_scale = kwargs.get("guidance_scale", 1.5)
         num_inference_steps = kwargs.get("num_inference_steps", 30)
-        true_cfg_scale = kwargs.get("true_cfg_scale", 1.0)  # Use true_cfg_scale for classifier-free guidance
-        guidance_scale = kwargs.get("guidance_scale", 1.0)  # This is a different parameter
-        scheduler = kwargs.get("scheduler", "EulerAncestral")
         
-        # Limit inference steps to reduce memory usage
-        num_inference_steps = min(num_inference_steps, 50)  # Cap at 50 steps
+        # Convert input image to base64
+        img_base64 = image_to_base64(image)
+        logger.debug(job_id, "Image converted to base64", 
+                    base64_length=len(img_base64))
         
-        # Validate true_cfg_scale parameter
-        if true_cfg_scale < 1.0:
-            logger.warning(job_id, "true_cfg_scale should be >= 1.0, setting to default value", true_cfg_scale=true_cfg_scale)
-            true_cfg_scale = 1.0
-        elif true_cfg_scale > 5.0:  # Reduced from 10.0 for stability
-            logger.warning(job_id, "true_cfg_scale is very high, this may cause issues", true_cfg_scale=true_cfg_scale)
-            
-        # Validate guidance_scale parameter
-        if guidance_scale < 1.0:
-            logger.warning(job_id, "guidance_scale should be >= 1.0, setting to default value", guidance_scale=guidance_scale)
-            guidance_scale = 5.0  # Changed default to 5.0 for better stability
-        elif guidance_scale > 10.0:  # Reduced from 20.0 for stability
-            logger.warning(job_id, "guidance_scale is very high, this may cause issues", guidance_scale=guidance_scale)
+        # Format prompt for Qwen-Image-Edit GGUF
+        # The model expects a special format with image embedded
+        # Format: <image>\n{prompt}\nEdit this image: <base64>
+        formatted_prompt = f"<image>\n{prompt}\nEdit this image: {img_base64}"
         
-        # Set scheduler if specified
-        scheduler_start = time.time()
-        try:
-            if scheduler == "DPMSolverMultistep":
-                from diffusers import DPMSolverMultistepScheduler
-                model.scheduler = DPMSolverMultistepScheduler.from_config(model.scheduler.config)
-            elif scheduler == "DDIM":
-                from diffusers import DDIMScheduler
-                model.scheduler = DDIMScheduler.from_config(model.scheduler.config)
-            elif scheduler == "DDPM":
-                from diffusers import DDPMScheduler
-                model.scheduler = DDPMScheduler.from_config(model.scheduler.config)
-            elif scheduler == "PNDM":
-                from diffusers import PNDMScheduler
-                model.scheduler = PNDMScheduler.from_config(model.scheduler.config)
-            elif scheduler == "LMSDiscrete":
-                from diffusers import LMSDiscreteScheduler
-                model.scheduler = LMSDiscreteScheduler.from_config(model.scheduler.config)
-            elif scheduler == "HeunDiscrete":
-                from diffusers import HeunDiscreteScheduler
-                model.scheduler = HeunDiscreteScheduler.from_config(model.scheduler.config)
-            elif scheduler == "KDPM2Ancestral":
-                from diffusers import KDPM2AncestralDiscreteScheduler
-                model.scheduler = KDPM2AncestralDiscreteScheduler.from_config(model.scheduler.config)
-            elif scheduler == "KDPM2":
-                from diffusers import KDPM2DiscreteScheduler
-                model.scheduler = KDPM2DiscreteScheduler.from_config(model.scheduler.config)
-            elif scheduler == "DEISMultistep":
-                from diffusers import DEISMultistepScheduler
-                model.scheduler = DEISMultistepScheduler.from_config(model.scheduler.config)
-            elif scheduler == "UniPCMultistep":
-                from diffusers import UniPCMultistepScheduler
-                model.scheduler = UniPCMultistepScheduler.from_config(model.scheduler.config)
-            # EulerAncestral is the default scheduler
-            
-            scheduler_time = time.time() - scheduler_start
-            logger.debug(job_id, "Scheduler configured", scheduler=scheduler, config_time=f"{scheduler_time:.2f}s")
-        except Exception as scheduler_error:
-            logger.error(job_id, "Error configuring scheduler", scheduler=scheduler, error=str(scheduler_error))
-            # Continue with default scheduler if there's an error
-            pass
+        logger.debug(job_id, "Formatted prompt", 
+                    prompt_length=len(formatted_prompt))
         
-        # Set generator for reproducible results if seed is provided
-        generator = None
-        if seed is not None:
-            import torch
-            generator = torch.Generator(device=model.device).manual_seed(seed)
-            logger.debug(job_id, "Generator set with seed", seed=seed)
+        # Generate with llama.cpp
+        logger.info(job_id, "Starting GGUF inference", 
+                   cfg_scale=cfg_scale,
+                   steps=num_inference_steps,
+                   seed=seed)
         
-        # Run the model with scaled dot-product attention
-        infer_start = time.time()
-        try:
-            logger.debug(job_id, "Calling model with parameters", 
-                        prompt=prompt, 
-                        negative_prompt=negative_prompt,
-                        num_inference_steps=num_inference_steps,
-                        true_cfg_scale=true_cfg_scale,
-                        guidance_scale=guidance_scale,
-                        generator_type=type(generator).__name__ if generator else "None",
-                        return_dict=True,  # Use return_dict=True to get QwenImagePipelineOutput
-                        image_type=type(image).__name__,
-                        image_mode=getattr(image, 'mode', 'N/A') if image else 'N/A')
-            
-            # Prepare the model call parameters
-            model_kwargs = {
-                "image": image,
-                "prompt": prompt,
-                "negative_prompt": negative_prompt,
-                "num_inference_steps": num_inference_steps,
-                "true_cfg_scale": true_cfg_scale,  # Use true_cfg_scale for classifier-free guidance
-                "guidance_scale": guidance_scale,  # Keep guidance_scale as a separate parameter
-                "generator": generator,
-                "return_dict": True,  # Use return_dict=True for consistent handling
-                "output_type": "pil",
-            }
-            
-            # Use scaled dot-product attention for the model inference
-            with attention_backend(AttentionBackendName.NATIVE):
-                result = model(**model_kwargs)
-            
-            logger.debug(job_id, "Model call completed successfully")
-        except Exception as model_error:
-            logger.error(job_id, "Error calling model", error=str(model_error), exc_info=True)
-            raise ValueError(f"Failed to call model: {str(model_error)}")
+        # Set random seed if not provided
+        if seed is None:
+            import random
+            seed = random.randint(1, 2**32 - 1)
+            logger.debug(job_id, "Generated random seed", seed=seed)
+        
+        output = model.create_chat_completion(
+            messages=[
+                {
+                    "role": "user",
+                    "content": formatted_prompt
+                }
+            ],
+            max_tokens=4096,  # Max output size (enough for base64 image)
+            temperature=0.7,
+            top_p=0.95,
+            seed=seed,
+        )
+        
+        logger.debug(job_id, "GGUF inference completed")
+        
+        # Extract response
+        response_text = output['choices'][0]['message']['content']
+        logger.debug(job_id, "Response received", 
+                    response_length=len(response_text),
+                    response_preview=response_text[:100] + "...")
+        
+        # Parse base64 from response
+        # Try different patterns
+        img_base64_result = None
+        
+        # Pattern 1: Markdown image format ![alt](base64)
+        markdown_match = re.search(r'!\[.*?\]\((data:image/\w+;base64,([^)]+))', response_text)
+        if markdown_match:
+            img_base64_result = markdown_match.group(2)
+            logger.debug(job_id, "Found base64 in markdown format")
+        
+        # Pattern 2: Direct base64 with data URI
+        if not img_base64_result:
+            data_uri_match = re.search(r'data:image/\w+;base64,([^"\')\s]+)', response_text)
+            if data_uri_match:
+                img_base64_result = data_uri_match.group(1)
+                logger.debug(job_id, "Found base64 in data URI format")
+        
+        # Pattern 3: Plain base64 (assuming whole response is base64)
+        if not img_base64_result:
+            # Check if the whole response looks like base64
+            if re.match(r'^[A-Za-z0-9+/=]+$', response_text.strip()):
+                img_base64_result = response_text.strip()
+                logger.debug(job_id, "Found plain base64 response")
+        
+        if not img_base64_result:
+            raise ValueError(f"Could not extract base64 image from response: {response_text[:200]}")
+        
+        # Decode base64 to image
+        result_image = base64_to_image(img_base64_result)
         
         infer_time = time.time() - infer_start
+        logger.info(job_id, "GGUF inference completed successfully", 
+                   inference_time=f"{infer_time:.2f}s",
+                   image_mode=result_image.mode,
+                   image_size=result_image.size)
         
-        # Clear GPU cache after inference to free up memory
-        try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                logger.debug(job_id, "Cleared CUDA cache after inference")
-        except Exception as e:
-            logger.warning(job_id, "Failed to clear CUDA cache", error=str(e))
+        return result_image
         
-        # Handle the result - the model should return a QwenImagePipelineOutput when return_dict=True
-        logger.debug(job_id, "Model result type", result_type=type(result).__name__)
-        
-        # According to the documentation, when return_dict=True, we get a QwenImagePipelineOutput
-        if hasattr(result, 'images') and result.images:
-            logger.info(job_id, "Model inference completed successfully", 
-                       inference_time=f"{infer_time:.2f}s",
-                       result_type="QwenImagePipelineOutput",
-                       num_images=len(result.images))
-            # Get the first image from the list
-            result_image = result.images[0]
-            
-            # Log information about the result image before processing
-            logger.debug(job_id, "Raw result image info", 
-                        mode=getattr(result_image, 'mode', 'N/A'),
-                        size=getattr(result_image, 'size', 'N/A') if hasattr(result_image, 'size') else 'N/A')
-            
-            # Add debugging for image values to detect NaN/inf issues
-            try:
-                import numpy as np
-                # Convert to numpy array to check for invalid values
-                img_array = np.array(result_image)
-                has_nan = np.isnan(img_array).any()
-                has_inf = np.isinf(img_array).any()
-                min_val = np.min(img_array)
-                max_val = np.max(img_array)
-                
-                logger.debug(job_id, "Image value analysis",
-                            has_nan=has_nan,
-                            has_inf=has_inf,
-                            min_val=float(min_val),
-                            max_val=float(max_val),
-                            dtype=str(img_array.dtype))
-                
-                if has_nan or has_inf:
-                    logger.warning(job_id, "Invalid values detected in generated image",
-                                  has_nan=has_nan,
-                                  has_inf=has_inf)
-            except Exception as debug_error:
-                logger.warning(job_id, "Failed to analyze image values", error=str(debug_error))
-            
-            return result_image
-        else:
-            raise ValueError(f"Model returned unexpected result: {type(result)}")
-            
     except Exception as e:
-        logger.error(job_id, "Error during model inference", error=str(e))
-        # Clear GPU cache even on error
-        try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                logger.debug(job_id, "Cleared CUDA cache after inference error")
-        except Exception as ce:
-            logger.warning(job_id, "Failed to clear CUDA cache after error", error=str(ce))
-        # Raise the error instead of returning the original image
+        logger.error(job_id, "Error during GGUF inference", error=str(e), exc_info=True)
         raise
-
 
 def handler(event):
     """Main handler function for Runpod serverless"""
@@ -493,10 +393,11 @@ def handler(event):
         infer_time = 0
         upload_time = 0
         
-        # Download image directly using diffusers.utils.load_image
-        logger.info(job_id, "Downloading image directly from URL")
+        # Download image
+        logger.info(job_id, "Downloading image from URL")
         download_start = time.time()
         try:
+            from diffusers.utils import load_image
             pil_image = load_image(str(input_data.image_url)).convert("RGB")
             width, height = pil_image.size
             download_time = time.time() - download_start
@@ -510,68 +411,49 @@ def handler(event):
             logger.error(job_id, "Error downloading image", error=str(download_error))
             raise ValueError(f"Failed to download image: {str(download_error)}")
         
-        # Run image editing
-        logger.info(job_id, "Starting image editing")
-        # Prepare parameters for the model
+        # Run image editing with GGUF
+        logger.info(job_id, "Starting image editing with GGUF")
+        
+        # Prepare parameters
         model_params = {
-            "negative_prompt": input_data.negative_prompt,
+            "seed": input_data.seed,
             "num_inference_steps": input_data.num_inference_steps,
-            "true_cfg_scale": input_data.extra.get("true_cfg_scale", 1.5),  # Use from extra or default to 1.5
             "guidance_scale": input_data.guidance_scale,
-            "scheduler": input_data.scheduler,
         }
         
-        # Handle seed parameter - generate random seed if not provided or invalid
-        if input_data.seed is None or input_data.seed <= 0:
+        # Add extra parameters if provided
+        model_params.update(input_data.extra)
+        
+        # Generate random seed if not provided or invalid
+        if model_params.get("seed") is None or model_params.get("seed") <= 0:
             import random
             model_params["seed"] = random.randint(1, 2**32 - 1)
             logger.info(job_id, "Generated random seed", seed=model_params["seed"])
-        else:
-            model_params["seed"] = input_data.seed
-            
-        # Add extra parameters (this allows users to override true_cfg_scale and other parameters)
-        model_params.update(input_data.extra)
         
-        # Validate extra parameters
-        if "true_cfg_scale" in model_params:
-            true_cfg_scale = model_params["true_cfg_scale"]
-            if true_cfg_scale < 1.0:
-                logger.warning(job_id, "true_cfg_scale in extra params should be >= 1.0, setting to default value", true_cfg_scale=true_cfg_scale)
-                model_params["true_cfg_scale"] = 1.0
-            elif true_cfg_scale > 10.0:
-                logger.warning(job_id, "true_cfg_scale in extra params is very high, this may cause issues", true_cfg_scale=true_cfg_scale)
-                
-        if "guidance_scale" in model_params:
-            guidance_scale = model_params["guidance_scale"]
-            if guidance_scale < 1.0:
-                logger.warning(job_id, "guidance_scale in extra params should be >= 1.0, setting to default value", guidance_scale=guidance_scale)
-                model_params["guidance_scale"] = 1.0
-            elif guidance_scale > 20.0:
-                logger.warning(job_id, "guidance_scale in extra params is very high, this may cause issues", guidance_scale=guidance_scale)
-        
-        # Log all model parameters for debugging
-        logger.debug(job_id, "Model parameters", **model_params)
-        
+        # Run inference
+        infer_start = time.time()
         try:
-            # Use scaled dot-product attention for the entire inference process
-            with attention_backend(AttentionBackendName.NATIVE):
-                edited_image = run_qwen_edit(
-                    job_id,
-                    model,
-                    pil_image,
-                    input_data.prompt,
-                    **model_params
-                )
+            edited_image = run_qwen_edit_gguf(
+                job_id,
+                model,
+                pil_image,
+                input_data.prompt,
+                **model_params
+            )
+            infer_time = time.time() - infer_start
+            logger.info(job_id, "Image editing completed", 
+                       inference_time=f"{infer_time:.2f}s")
+            
         except Exception as e:
             logger.error(job_id, "Error during image editing", error=str(e))
             raise ValueError(f"Failed to edit image: {str(e)}")
         
-        # Save result as PNG temporarily
+        # Save result as PNG
         try:
             if edited_image.mode not in ("RGB", "L"):
                 edited_image = edited_image.convert("RGB")
-
-            result_filename = f"{url_hash}.png"
+            
+            result_filename = f"/tmp/{url_hash}_{job_id}.png"
             edited_image.save(result_filename)
             
             # Read the saved PNG file
@@ -580,11 +462,12 @@ def handler(event):
             
             result_ext = "png"
             result_content_type = "image/png"
+            
         except Exception as save_error:
             logger.error(job_id, "Error saving result image", error=str(save_error))
             raise ValueError(f"Failed to save result image: {str(save_error)}")
         
-        # Upload result
+        # Upload result to S3
         upload_start = time.time()
         try:
             result_key = f"{S3_OBJECT_PREFIX}results/{url_hash}/{job_id}.{result_ext}"
@@ -610,6 +493,7 @@ def handler(event):
                 expires=timedelta(seconds=PRESIGN_EXPIRY)
             )
             upload_time = time.time() - upload_start
+            
         except Exception as upload_error:
             logger.error(job_id, "Error uploading result", error=str(upload_error))
             raise ValueError(f"Failed to upload result: {str(upload_error)}")
@@ -624,14 +508,11 @@ def handler(event):
         meta = {
             "source_url": str(input_data.image_url),
             "url_sha256": url_hash,
-            "model": "Qwen/Qwen-Image-Edit",
+            "model": "Qwen-Image-Edit-GGUF-Q4_K_M",
             "prompt": input_data.prompt,
-            "negative_prompt": input_data.negative_prompt,
-            "seed": model_params["seed"],  # Use the actual seed used in generation
+            "seed": model_params["seed"],
             "num_inference_steps": input_data.num_inference_steps,
-            "true_cfg_scale": model_params.get("true_cfg_scale", 1.0),
             "guidance_scale": input_data.guidance_scale,
-            "scheduler": input_data.scheduler,
             "runtime": {
                 "latency_ms_total": int(total_time * 1000),
                 "latency_ms_download": int(download_time * 1000),
@@ -641,7 +522,6 @@ def handler(event):
             "image": {
                 "width": width,
                 "height": height,
-                "mode": pil_image.mode,
                 "format": result_ext.upper()
             }
         }
@@ -695,5 +575,5 @@ except Exception as e:
 if __name__ == "__main__":
     # Create a temporary logger instance for startup
     temp_logger = StructuredLogger(__name__)
-    temp_logger.info("STARTUP", "Starting Runpod serverless handler for Qwen-Image-Edit")
+    temp_logger.info("STARTUP", "Starting Runpod serverless handler for Qwen-Image-Edit GGUF")
     runpod.serverless.start({"handler": handler})
